@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import os
 import time
+from pathlib import Path
 from statistics import median
 
 from toss_sleeve.api.auth import TossAuth
@@ -32,6 +33,25 @@ from toss_sleeve.config import TossConfig
 from toss_sleeve.ratelimit import RateLimiter
 
 _DEFAULT_SYMBOLS = "005930,000660,035720,051910,006400,035420,028260,068270"
+
+
+def _load_dotenv(path: str = ".env") -> None:
+    """CWD 의 .env 를 읽어 os.environ 에 채운다(stdlib 만, 의존성 0). 이미 설정된 키는 덮지 않는다.
+
+    KEY=VALUE 줄만 처리(주석/빈 줄 무시, 양끝 따옴표 제거). 시크릿은 출력하지 않는다.
+    """
+    f = Path(path)
+    if not f.is_file():
+        return
+    for line in f.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
 
 
 def _pct(samples: list[float], q: float) -> float:
@@ -61,24 +81,49 @@ async def _phase_prices(rest: TossRest, symbols: list[str], seconds: float) -> N
     latencies: list[float] = []
     errors = 0
     polls = 0
+    # 서버측 실제 갱신율: 폴 Hz 와 무관하게 timestamp/lastPrice 가 *바뀐* 빈도. 토스가 공시 안 하는
+    # 값이라 경험적으로 잰다 — 과다폴링(같은 값 반복 수신) 구간을 드러낸다.
+    last_ts: dict[str, str] = {}
+    last_px: dict[str, str] = {}
+    ts_changes: dict[str, int] = {}
+    px_changes: dict[str, int] = {}
     start = time.monotonic()
     while time.monotonic() - start < seconds:
         t0 = time.monotonic()
         try:
-            await rest.prices(symbols)
+            quotes = await rest.prices(symbols)
         except Exception as exc:  # noqa: BLE001 — 측정 중 어떤 실패든 집계만.
             errors += 1
             if errors <= 3:
                 print(f"  err: {type(exc).__name__}: {exc}")
         else:
             latencies.append((time.monotonic() - t0) * 1000)
+            for q in quotes:
+                px = str(q.last_price)
+                if q.symbol in last_ts and q.timestamp != last_ts[q.symbol]:
+                    ts_changes[q.symbol] = ts_changes.get(q.symbol, 0) + 1
+                if q.symbol in last_px and px != last_px[q.symbol]:
+                    px_changes[q.symbol] = px_changes.get(q.symbol, 0) + 1
+                last_ts[q.symbol] = q.timestamp
+                last_px[q.symbol] = px
         polls += 1
     elapsed = time.monotonic() - start
     hz = polls / elapsed if elapsed else 0.0
-    print(f"  polls={polls} in {elapsed:.1f}s  →  {hz:.1f} Hz (종목당 갱신주기 ≈ {1000 / hz if hz else 0:.0f}ms)")
+    print(f"  polls={polls} in {elapsed:.1f}s  →  poll {hz:.1f} Hz (폴 간격 ≈ {1000 / hz if hz else 0:.0f}ms)")
     print(f"  latency ms: p50={median(latencies) if latencies else 0:.0f} "
-          f"p95={_pct(latencies, 0.95):.0f} max={max(latencies) if latencies else 0:.0f}")
-    print(f"  errors={errors}")
+          f"p95={_pct(latencies, 0.95):.0f} max={max(latencies) if latencies else 0:.0f}  errors={errors}")
+    # 서버측 갱신율 — 종목별 timestamp/price 변화 Hz 의 분포. 폴 Hz 보다 *낮으면* 그 차이는 과다폴링.
+    ts_hz = [c / elapsed for c in ts_changes.values()] if elapsed else []
+    px_hz = [c / elapsed for c in px_changes.values()] if elapsed else []
+    if ts_hz:
+        print(f"  server timestamp 변화: median {median(ts_hz):.1f} Hz "
+              f"(min {min(ts_hz):.1f} / max {max(ts_hz):.1f}) across {len(ts_hz)} symbols")
+    if px_hz:
+        print(f"  server lastPrice 변화: median {median(px_hz):.1f} Hz "
+              f"(min {min(px_hz):.1f} / max {max(px_hz):.1f})")
+    if ts_hz and hz:
+        yield_pct = 100 * median(ts_hz) / hz
+        print(f"  freshness yield ≈ {yield_pct:.0f}% (서버 갱신Hz / 폴Hz — 낮을수록 과다폴링)")
 
 
 async def _phase_orderbook(rest: TossRest, symbols: list[str], seconds: float) -> None:
@@ -118,6 +163,7 @@ async def _main() -> None:
     parser.add_argument("--orderbook", action="store_true", help="Phase B(호가 depth) 도 측정")
     args = parser.parse_args()
 
+    _load_dotenv()  # CWD 의 .env 자동 로드(채워넣고 바로 실행).
     symbols = [s.strip() for s in os.environ.get("TOSS_PROBE_SYMBOLS", _DEFAULT_SYMBOLS).split(",") if s.strip()]
     config = _config()
     auth = TossAuth(config)
