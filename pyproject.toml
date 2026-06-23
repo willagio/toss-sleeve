@@ -1,6 +1,6 @@
 [project]
 name = "toss-sleeve"
-version = "0.1.0"
+version = "0.1.1"
 description = "Toss Securities Open API 브로커 + 공유계좌 sleeve 가상현금 원장 (프로젝트 무관 프리미티브)"
 readme = "README.md"
 requires-python = ">=3.12"
