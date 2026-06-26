@@ -18,7 +18,7 @@ from decimal import Decimal
 
 import httpx
 
-from toss_sleeve.api.auth import TossAuth
+from toss_sleeve.api.auth import TossAuth, request_with_reauth
 from toss_sleeve.api.constants import (
     ORDERS_PATH,
     TossAmbiguousOrderError,
@@ -26,7 +26,6 @@ from toss_sleeve.api.constants import (
     TossTransportError,
     cancel_path,
     is_business_rejection,
-    parse_toss,
 )
 from toss_sleeve.api.rest import TossRest
 from toss_sleeve.config import TossConfig
@@ -127,13 +126,19 @@ class TossBroker:
         ) from last_exc
 
     async def _post(self, path: str, body: dict[str, object], *, ambiguous: bool) -> object:
-        headers = await self._auth.auth_headers()
-        headers["X-Tossinvest-Account"] = await self._rest.account_seq()
         client = self._get_client()
-        resp = await self._send(
-            lambda: client.post(path, json=body, headers=headers), ambiguous=ambiguous
-        )
-        return parse_toss(resp, ambiguous=ambiguous)
+
+        async def send(headers: dict[str, str]) -> httpx.Response:
+            h = dict(headers)  # 재시도 때 fresh 인증헤더 — 복사 후 계좌헤더만 덧붙인다.
+            h["X-Tossinvest-Account"] = await self._rest.account_seq()
+            return await self._send(
+                lambda: client.post(path, json=body, headers=h), ambiguous=ambiguous
+            )
+
+        # 401(서버측 토큰 무효화)이면 토큰 재발급 후 1회 재시도. 401 은 인증단계 거부(미발송)라
+        # 재전송이 안전하다(발주 멱등키와 무관). 5xx/타임아웃(모호 착지)은 _send 가
+        # TossAmbiguousOrderError 로 send 단계에서 올려 전파한다(재시도 안 함 — 소비자가 잔고 대조).
+        return await request_with_reauth(self._auth, send, ambiguous=ambiguous)
 
     # --- Broker protocol ----------------------------------------------------
 

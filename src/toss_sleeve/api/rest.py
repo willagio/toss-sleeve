@@ -14,7 +14,7 @@ from decimal import Decimal, InvalidOperation
 
 import httpx
 
-from toss_sleeve.api.auth import TossAuth
+from toss_sleeve.api.auth import TossAuth, request_with_reauth
 from toss_sleeve.api.constants import (
     ACCOUNTS_PATH,
     BUYING_POWER_PATH,
@@ -25,7 +25,6 @@ from toss_sleeve.api.constants import (
     TossError,
     TossTransportError,
     order_detail_path,
-    parse_toss,
 )
 from toss_sleeve.config import TossConfig
 from toss_sleeve.ratelimit import RateLimiter
@@ -120,30 +119,38 @@ class TossRest:
     async def _get(
         self, path: str, *, account: bool, params: dict[str, str] | None = None
     ) -> object:
-        await self._ratelimiter.acquire()
-        headers = await self._auth.auth_headers()
-        if account:
-            headers["X-Tossinvest-Account"] = await self.account_seq()
         client = self._get_client()
-        try:
-            resp = await client.get(path, params=params or {}, headers=headers)
-        except httpx.HTTPError as exc:
-            # 전송 실패(연결·읽기 타임아웃)는 소비자가 흡수하도록 TossTransportError 로 정규화.
-            raise TossTransportError("Toss 읽기 전송 실패") from exc
-        return parse_toss(resp)
+
+        async def send(headers: dict[str, str]) -> httpx.Response:
+            # 한도 소비는 *매 전송 시도* 마다 — 401 재시도의 두 번째 GET 도 같은 윈도우에서 한도를
+            # 소비해야 ASSET TPS 가드를 우회하지 않는다(버스트 429 방지).
+            await self._ratelimiter.acquire()
+            h = dict(headers)  # 재시도 때 fresh 인증헤더를 받으므로 복사 후 계좌헤더만 덧붙인다.
+            if account:
+                h["X-Tossinvest-Account"] = await self.account_seq()
+            try:
+                return await client.get(path, params=params or {}, headers=h)
+            except httpx.HTTPError as exc:
+                # 전송 실패(연결·읽기 타임아웃)는 소비자가 흡수하도록 TossTransportError 로 정규화.
+                raise TossTransportError("Toss 읽기 전송 실패") from exc
+
+        # 401(서버측 토큰 무효화)이면 토큰 재발급 후 1회 재시도(request_with_reauth).
+        return await request_with_reauth(self._auth, send)
 
     async def account_seq(self) -> str:
         """X-Tossinvest-Account 값(accountSeq). 주입값 우선, 없으면 GET /accounts 첫 계좌."""
         if self._account_seq:
             return self._account_seq
-        await self._ratelimiter.acquire()
-        headers = await self._auth.auth_headers()
         client = self._get_client()
-        try:
-            resp = await client.get(ACCOUNTS_PATH, headers=headers)
-        except httpx.HTTPError as exc:
-            raise TossTransportError("계좌 조회 전송 실패") from exc
-        result = parse_toss(resp)
+
+        async def send(headers: dict[str, str]) -> httpx.Response:
+            await self._ratelimiter.acquire()  # 매 전송 시도마다 한도 소비(401 재시도 포함).
+            try:
+                return await client.get(ACCOUNTS_PATH, headers=headers)
+            except httpx.HTTPError as exc:
+                raise TossTransportError("계좌 조회 전송 실패") from exc
+
+        result = await request_with_reauth(self._auth, send)
         accounts = result if isinstance(result, list) else []
         if not accounts or not isinstance(accounts[0], dict):
             raise TossError("계좌 조회 실패: accounts 비어있음")
